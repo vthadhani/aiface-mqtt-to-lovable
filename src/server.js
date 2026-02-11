@@ -26,6 +26,10 @@ const MQTT_CONNECT_TIMEOUT = Math.max(parseInt(process.env.MQTT_CONNECT_TIMEOUT 
 const MQTT_CLEAN = (process.env.MQTT_CLEAN || "false").toLowerCase() === "true";
 const MQTT_QOS = Number.isFinite(Number(process.env.MQTT_QOS)) ? Number(process.env.MQTT_QOS) : 1;
 
+// Device protocol: ACK topic suffix
+const MQTT_ACK_TOPIC_SUFFIX = process.env.MQTT_ACK_TOPIC_SUFFIX || "/pub"; // device listens on aiface/<SN>/pub
+const MQTT_SUB_TOPIC_SUFFIX = process.env.MQTT_SUB_TOPIC_SUFFIX || "/sub"; // device sends on aiface/<SN>/sub
+
 const LOVABLE_ENDPOINT =
   process.env.LOVABLE_ENDPOINT || "https://ndmytnnbirezyrqvejwz.supabase.co/functions/v1/attendance-api";
 const LOVABLE_API_KEY = process.env.LOVABLE_API_KEY;
@@ -33,7 +37,6 @@ const LOVABLE_API_KEY = process.env.LOVABLE_API_KEY;
 const DEDUPE_SECONDS = Math.max(parseInt(process.env.DEDUPE_SECONDS || "0", 10), 0);
 
 // If true, we will drop records that don't have enough data to be meaningful
-// (enrollid + timestamp required; inout optional but strongly preferred)
 const DROP_INCOMPLETE = (process.env.DROP_INCOMPLETE || "true").toLowerCase() === "true";
 
 if (!MQTT_URL) {
@@ -82,12 +85,70 @@ function normalizeEnrollId(value) {
 }
 
 function normalizeTimestamp(value) {
-  // Your device sends "YYYY-MM-DD HH:mm:ss"
-  // Lovable showed "2026-02-08 08:08:06+00" on its side — that's fine.
-  // We'll pass through the device time if present, otherwise ISO.
+  // Device sends "YYYY-MM-DD HH:mm:ss"
   const t = value || null;
   if (!t) return new Date().toISOString();
   return t;
+}
+
+// ---- NEW: cloudtime formatting for ACK ----
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+function formatCloudTime(d = new Date()) {
+  // "YYYY-MM-DD HH:mm:ss"
+  const yyyy = d.getFullYear();
+  const mm = pad2(d.getMonth() + 1);
+  const dd = pad2(d.getDate());
+  const hh = pad2(d.getHours());
+  const mi = pad2(d.getMinutes());
+  const ss = pad2(d.getSeconds());
+  return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss}`;
+}
+
+// ---- NEW: derive SN from topic if msg.sn is missing ----
+function extractSnFromTopic(topic) {
+  // Expected: aiface/<SN>/sub
+  const parts = String(topic || "").split("/");
+  if (parts.length >= 3 && parts[0] === "aiface") {
+    return parts[1] || null;
+  }
+  return null;
+}
+
+// ---- NEW: publish ACK for sendlog ----
+function publishSendlogAck({ sn, count, logindex }) {
+  if (!sn) return;
+
+  const ackTopic = `aiface/${sn}${MQTT_ACK_TOPIC_SUFFIX}`;
+  const payload = {
+    ret: "sendlog",
+    result: true,
+    count: typeof count === "number" ? count : parseInt(String(count || "0"), 10) || 0,
+    logindex: typeof logindex === "number" ? logindex : parseInt(String(logindex || "0"), 10) || 0,
+    cloudtime: formatCloudTime(new Date()),
+  };
+
+  try {
+    mqttClient.publish(ackTopic, JSON.stringify(payload), { qos: 1, retain: false }, (err) => {
+      if (err) {
+        stats.ackErrors += 1;
+        stats.lastAckError = err.message;
+        stats.lastAckErrorAt = new Date().toISOString();
+        console.error(`ACK publish error to ${ackTopic}:`, err.message);
+      } else {
+        stats.acksSent += 1;
+        stats.lastAckAt = new Date().toISOString();
+        stats.lastAck = { sn, count: payload.count, logindex: payload.logindex };
+        console.log(`ACK sent -> ${ackTopic} count=${payload.count} logindex=${payload.logindex}`);
+      }
+    });
+  } catch (e) {
+    stats.ackErrors += 1;
+    stats.lastAckError = e?.message || String(e);
+    stats.lastAckErrorAt = new Date().toISOString();
+    console.error(`ACK publish exception to ${ackTopic}:`, stats.lastAckError);
+  }
 }
 
 async function postToLovable(payload) {
@@ -126,6 +187,15 @@ let stats = {
 
   receivedMessages: 0,
   receivedSendlog: 0,
+
+  // NEW ack stats
+  acksSent: 0,
+  ackErrors: 0,
+  lastAckAt: null,
+  lastAck: null,
+  lastAckErrorAt: null,
+  lastAckError: null,
+
   forwarded: 0,
   forwardedBulk: 0,
   droppedIncomplete: 0,
@@ -153,23 +223,15 @@ async function handleSendLog(msg) {
       continue;
     }
 
-    // Pull as much as possible from the device record
     const inout = rec.inout ?? null;
     const mode = rec.mode ?? null;
     const event = rec.event ?? null;
     const name = rec.name ?? null;
 
-    const action = inferActionFromInout(inout) || "clock_in"; // fallback if device doesn't provide inout
-
+    const action = inferActionFromInout(inout) || "clock_in";
     const timestamp = normalizeTimestamp(rec.time || msg.cloudtime);
 
-    // If configured, drop records that are missing "inout" (because it's meaningless for in/out reporting)
     if (DROP_INCOMPLETE) {
-      // enrollid + timestamp required. Optionally also require inout to avoid junk.
-      // Here we require enrollid + timestamp always, and strongly prefer inout when present.
-      // If you want to HARD REQUIRE inout, uncomment:
-      // if (inout === null || inout === undefined || inout === "") { stats.droppedIncomplete += 1; continue; }
-
       if (!timestamp) {
         stats.droppedIncomplete += 1;
         continue;
@@ -183,7 +245,6 @@ async function handleSendLog(msg) {
     }
 
     out.push({
-      // keep your existing fields
       action,
       enrollid,
       timestamp,
@@ -191,16 +252,13 @@ async function handleSendLog(msg) {
       biometric_verified: true,
       notes: null,
 
-      // ADD: richer fields for Lovable UI / auditing
       inout,
       mode,
       event,
       name,
 
-      // ADD: store the original device record so Lovable can render nested details
       raw_json: rec,
 
-      // Optional: also store the full device message (can be large). Keep if you want.
       raw_msg: {
         cmd: msg.cmd,
         sn: msg.sn,
@@ -213,7 +271,6 @@ async function handleSendLog(msg) {
 
   if (!out.length) return;
 
-  // Bulk forward
   const payload = {
     action: "bulk",
     records: out,
@@ -233,7 +290,12 @@ async function handleIncomingMqtt(topic, payloadStr) {
 
   // Only care about cmd:"sendlog"
   if (msg.cmd === "sendlog") {
-    await handleSendLog(msg);
+    // ---- NEW: ACK FIRST (never wait for Lovable) ----
+    const sn = msg.sn || extractSnFromTopic(topic);
+    publishSendlogAck({ sn, count: msg.count, logindex: msg.logindex });
+
+    // Then forward to Lovable
+    await handleSendLog({ ...msg, sn: sn || msg.sn });
   }
 }
 
@@ -355,6 +417,7 @@ app.get("/health", (req, res) => {
     config: {
       dedupeSeconds: DEDUPE_SECONDS,
       dropIncomplete: DROP_INCOMPLETE,
+      ackTopicSuffix: MQTT_ACK_TOPIC_SUFFIX,
     },
     stats,
     time: new Date().toISOString(),
