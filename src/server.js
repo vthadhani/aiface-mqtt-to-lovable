@@ -4,6 +4,7 @@ const express = require("express");
 const helmet = require("helmet");
 const morgan = require("morgan");
 const mqtt = require("mqtt");
+const Database = require("better-sqlite3");
 
 // Node 18+ has global fetch. If you're on Node 16, pin Node 18 in Coolify.
 if (typeof fetch !== "function") {
@@ -17,18 +18,16 @@ const MQTT_URL = process.env.MQTT_URL;
 const MQTT_SUB_TOPIC = process.env.MQTT_SUB_TOPIC || "aiface/+/sub";
 
 // Stability settings (env overridable)
-const MQTT_CLIENT_ID = process.env.MQTT_CLIENT_ID || "aiface-lovable-bridge"; // MUST be stable + unique per running instance
+const MQTT_CLIENT_ID = process.env.MQTT_CLIENT_ID || "aiface-lovable-bridge";
 const MQTT_USERNAME = process.env.MQTT_USERNAME || undefined;
 const MQTT_PASSWORD = process.env.MQTT_PASSWORD || undefined;
-const MQTT_KEEPALIVE = Math.max(parseInt(process.env.MQTT_KEEPALIVE || "60", 10), 10); // seconds
-const MQTT_RECONNECT_PERIOD = Math.max(parseInt(process.env.MQTT_RECONNECT_PERIOD || "5000", 10), 1000); // ms
-const MQTT_CONNECT_TIMEOUT = Math.max(parseInt(process.env.MQTT_CONNECT_TIMEOUT || "20000", 10), 5000); // ms
+const MQTT_KEEPALIVE = Math.max(parseInt(process.env.MQTT_KEEPALIVE || "60", 10), 10);
+const MQTT_RECONNECT_PERIOD = Math.max(parseInt(process.env.MQTT_RECONNECT_PERIOD || "5000", 10), 1000);
+const MQTT_CONNECT_TIMEOUT = Math.max(parseInt(process.env.MQTT_CONNECT_TIMEOUT || "20000", 10), 5000);
 const MQTT_CLEAN = (process.env.MQTT_CLEAN || "false").toLowerCase() === "true";
 const MQTT_QOS = Number.isFinite(Number(process.env.MQTT_QOS)) ? Number(process.env.MQTT_QOS) : 1;
 
-// Device protocol topic suffixes (defaults match Aiface convention)
-const MQTT_ACK_TOPIC_SUFFIX = process.env.MQTT_ACK_TOPIC_SUFFIX || "/pub"; // device listens: aiface/<SN>/pub
-const MQTT_SUB_TOPIC_SUFFIX = process.env.MQTT_SUB_TOPIC_SUFFIX || "/sub"; // device sends:   aiface/<SN>/sub
+const MQTT_ACK_TOPIC_SUFFIX = process.env.MQTT_ACK_TOPIC_SUFFIX || "/pub";
 
 const LOVABLE_ENDPOINT =
   process.env.LOVABLE_ENDPOINT || "https://ndmytnnbirezyrqvejwz.supabase.co/functions/v1/attendance-api";
@@ -40,6 +39,11 @@ const DROP_INCOMPLETE = (process.env.DROP_INCOMPLETE || "true").toLowerCase() ==
 // Observability controls
 const RECENT_EVENTS_MAX = Math.max(parseInt(process.env.RECENT_EVENTS_MAX || "200", 10), 20);
 const LOVABLE_RESPONSE_MAX_CHARS = Math.max(parseInt(process.env.LOVABLE_RESPONSE_MAX_CHARS || "1200", 10), 100);
+
+// Queue / DB
+const QUEUE_DB_PATH = process.env.QUEUE_DB_PATH || "./bridge-queue.sqlite";
+const QUEUE_RETRY_INTERVAL_SECONDS = Math.max(parseInt(process.env.QUEUE_RETRY_INTERVAL_SECONDS || "30", 10), 5);
+const QUEUE_RETRY_BATCH_SIZE = Math.max(parseInt(process.env.QUEUE_RETRY_BATCH_SIZE || "50", 10), 1);
 
 if (!MQTT_URL) {
   console.error("ERROR: MQTT_URL is required.");
@@ -63,9 +67,7 @@ function safeParseJson(payload) {
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
-
 function formatCloudTime(d = new Date()) {
-  // "YYYY-MM-DD HH:mm:ss"
   const yyyy = d.getFullYear();
   const mm = pad2(d.getMonth() + 1);
   const dd = pad2(d.getDate());
@@ -76,7 +78,6 @@ function formatCloudTime(d = new Date()) {
 }
 
 function extractSnFromTopic(topic) {
-  // Expected: aiface/<SN>/sub
   const parts = String(topic || "").split("/");
   if (parts.length >= 3 && parts[0] === "aiface") return parts[1] || null;
   return null;
@@ -95,7 +96,6 @@ function normalizeEnrollId(value) {
 }
 
 function normalizeTimestamp(value) {
-  // device sends "YYYY-MM-DD HH:mm:ss"
   const t = value || null;
   if (!t) return new Date().toISOString();
   return t;
@@ -125,14 +125,7 @@ function dedupe(key) {
 
 // -------------------- recent events ring buffer --------------------
 
-/**
- * Recent “truth” events so you can answer:
- * - received?
- * - acked?
- * - sent to lovable?
- * - lovable response ok/error?
- */
-const recentEvents = []; // newest last
+const recentEvents = [];
 function pushEvent(ev) {
   const e = { at: new Date().toISOString(), ...ev };
   recentEvents.push(e);
@@ -153,12 +146,107 @@ function summarizeRecords(records) {
   };
 }
 
-// -------------------- Lovable POST with observability --------------------
+// -------------------- SQLite store-and-forward --------------------
+
+const db = new Database(QUEUE_DB_PATH);
+db.pragma("journal_mode = WAL");
+db.pragma("synchronous = NORMAL");
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS mqtt_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  sn TEXT,
+  topic TEXT,
+  cmd TEXT,
+  count INTEGER,
+  logindex INTEGER,
+  payload_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS punch_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  created_at TEXT NOT NULL,
+  sn TEXT,
+  enrollid INTEGER,
+  timestamp TEXT,
+  action TEXT,
+  payload_json TEXT NOT NULL,
+
+  status TEXT NOT NULL DEFAULT 'pending',  -- pending | sent | failed
+  attempts INTEGER NOT NULL DEFAULT 0,
+  last_attempt_at TEXT,
+  last_error TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_punch_queue_status ON punch_queue(status);
+CREATE INDEX IF NOT EXISTS idx_punch_queue_sn_time ON punch_queue(sn, timestamp);
+`);
+
+const stmtInsertBatch = db.prepare(`
+  INSERT INTO mqtt_batches (created_at, sn, topic, cmd, count, logindex, payload_json)
+  VALUES (@created_at, @sn, @topic, @cmd, @count, @logindex, @payload_json)
+`);
+
+const stmtInsertPunch = db.prepare(`
+  INSERT INTO punch_queue (created_at, sn, enrollid, timestamp, action, payload_json, status)
+  VALUES (@created_at, @sn, @enrollid, @timestamp, @action, @payload_json, 'pending')
+`);
+
+const stmtSelectPending = db.prepare(`
+  SELECT * FROM punch_queue
+  WHERE status IN ('pending','failed')
+  ORDER BY id ASC
+  LIMIT ?
+`);
+
+const stmtMarkSent = db.prepare(`
+  UPDATE punch_queue
+  SET status='sent', attempts=attempts+1, last_attempt_at=@at, last_error=NULL
+  WHERE id=@id
+`);
+
+const stmtMarkFailed = db.prepare(`
+  UPDATE punch_queue
+  SET status='failed', attempts=attempts+1, last_attempt_at=@at, last_error=@err
+  WHERE id=@id
+`);
+
+const stmtQueueStats = db.prepare(`
+  SELECT
+    SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END) AS pending,
+    SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed,
+    SUM(CASE WHEN status='sent' THEN 1 ELSE 0 END) AS sent,
+    COUNT(*) AS total
+  FROM punch_queue
+`);
+
+const stmtLatestQueueItems = db.prepare(`
+  SELECT id, created_at, sn, enrollid, timestamp, action, status, attempts, last_attempt_at, last_error
+  FROM punch_queue
+  ORDER BY id DESC
+  LIMIT ?
+`);
+
+// -------------------- Lovable POST (with correct OK/NOT OK detection) --------------------
+
+function lovableLogicalOk(data) {
+  // We treat these as success:
+  // - data.ok === true AND (no results OR all results ok)
+  // Anything else becomes failure so records remain queued.
+  if (!data || typeof data !== "object") return false;
+
+  if (data.ok !== true) return false;
+
+  if (Array.isArray(data.results)) {
+    return data.results.every((r) => r && r.ok === true);
+  }
+  return true;
+}
 
 async function postToLovable(payload, context = {}) {
   const startedAt = Date.now();
 
-  // mark: we are sending (attempt)
   pushEvent({
     type: "lovable_send_attempt",
     ...context,
@@ -166,12 +254,6 @@ async function postToLovable(payload, context = {}) {
     payloadSummary: {
       action: payload?.action,
       records: Array.isArray(payload?.records) ? payload.records.length : null,
-      sample: Array.isArray(payload?.records) ? payload.records.slice(0, 3).map((r) => ({
-        device_sn: r.device_sn,
-        enrollid: r.enrollid,
-        timestamp: r.timestamp,
-        action: r.action,
-      })) : null,
     },
   });
 
@@ -186,32 +268,33 @@ async function postToLovable(payload, context = {}) {
 
   const ms = Date.now() - startedAt;
   const text = await res.text();
+  const snippet = truncate(text, LOVABLE_RESPONSE_MAX_CHARS);
 
-  let parsed;
+  let data;
   try {
-    parsed = JSON.parse(text);
+    data = JSON.parse(text);
   } catch {
-    parsed = null;
+    data = { raw: text };
   }
 
-  const responseSnippet = truncate(text, LOVABLE_RESPONSE_MAX_CHARS);
+  const logicalOk = res.ok && lovableLogicalOk(data);
 
-  // mark: response received
   pushEvent({
     type: "lovable_response",
     ...context,
-    ok: res.ok,
+    httpOk: res.ok,
+    ok: logicalOk,
     status: res.status,
     ms,
-    responseSnippet,
+    responseSnippet: snippet,
   });
 
-  if (!res.ok) {
-    const err = `Lovable error ${res.status}: ${responseSnippet}`;
-    throw new Error(err);
+  if (!logicalOk) {
+    // even if HTTP 200, treat embedded ok:false as failure
+    throw new Error(`Lovable NOT OK (http=${res.status}): ${snippet}`);
   }
 
-  return parsed ?? { raw: text };
+  return data;
 }
 
 // -------------------- stats --------------------
@@ -228,7 +311,6 @@ let stats = {
   receivedMessages: 0,
   receivedSendlog: 0,
 
-  // ACK stats
   acksSent: 0,
   ackErrors: 0,
   lastAckAt: null,
@@ -236,20 +318,18 @@ let stats = {
   lastAckErrorAt: null,
   lastAckError: null,
 
-  // forward stats
+  queuedPunches: 0,
+  queuedBatches: 0,
+
   forwarded: 0,
   forwardedBulk: 0,
   droppedIncomplete: 0,
   deduped: 0,
 
-  // lovable stats
   lovableOk: 0,
   lovableErr: 0,
   lovableLastAt: null,
   lovableLastOk: null,
-  lovableLastStatus: null,
-  lovableLastMs: null,
-  lovableLastSnippet: null,
   lovableLastError: null,
 
   errors: 0,
@@ -271,14 +351,7 @@ function publishSendlogAck({ sn, count, logindex }) {
     cloudtime: formatCloudTime(new Date()),
   };
 
-  // record in recent events (attempt)
-  pushEvent({
-    type: "ack_send_attempt",
-    sn,
-    ackTopic,
-    count: payload.count,
-    logindex: payload.logindex,
-  });
+  pushEvent({ type: "ack_send_attempt", sn, ackTopic, count: payload.count, logindex: payload.logindex });
 
   try {
     mqttClient.publish(ackTopic, JSON.stringify(payload), { qos: 1, retain: false }, (err) => {
@@ -287,31 +360,13 @@ function publishSendlogAck({ sn, count, logindex }) {
         stats.lastAckError = err.message;
         stats.lastAckErrorAt = new Date().toISOString();
         console.error(`ACK publish error to ${ackTopic}:`, err.message);
-
-        pushEvent({
-          type: "ack_send_result",
-          sn,
-          ackTopic,
-          ok: false,
-          error: err.message,
-          count: payload.count,
-          logindex: payload.logindex,
-        });
+        pushEvent({ type: "ack_send_result", sn, ackTopic, ok: false, error: err.message, count: payload.count, logindex: payload.logindex });
       } else {
         stats.acksSent += 1;
         stats.lastAckAt = new Date().toISOString();
         stats.lastAck = { sn, count: payload.count, logindex: payload.logindex };
-
         console.log(`ACK sent -> ${ackTopic} count=${payload.count} logindex=${payload.logindex}`);
-
-        pushEvent({
-          type: "ack_send_result",
-          sn,
-          ackTopic,
-          ok: true,
-          count: payload.count,
-          logindex: payload.logindex,
-        });
+        pushEvent({ type: "ack_send_result", sn, ackTopic, ok: true, count: payload.count, logindex: payload.logindex });
       }
     });
   } catch (e) {
@@ -319,39 +374,60 @@ function publishSendlogAck({ sn, count, logindex }) {
     stats.lastAckError = e?.message || String(e);
     stats.lastAckErrorAt = new Date().toISOString();
     console.error(`ACK publish exception to ${ackTopic}:`, stats.lastAckError);
-
-    pushEvent({
-      type: "ack_send_result",
-      sn,
-      ackTopic,
-      ok: false,
-      error: stats.lastAckError,
-      count: payload.count,
-      logindex: payload.logindex,
-    });
+    pushEvent({ type: "ack_send_result", sn, ackTopic, ok: false, error: stats.lastAckError, count: payload.count, logindex: payload.logindex });
   }
 }
 
 // -------------------- core handling --------------------
 
-async function handleSendLog(msg, context = {}) {
-  stats.receivedSendlog += 1;
+function storeBatch({ sn, topic, msg }) {
+  try {
+    stmtInsertBatch.run({
+      created_at: new Date().toISOString(),
+      sn,
+      topic,
+      cmd: msg.cmd ?? null,
+      count: typeof msg.count === "number" ? msg.count : (parseInt(String(msg.count || "0"), 10) || 0),
+      logindex: typeof msg.logindex === "number" ? msg.logindex : (parseInt(String(msg.logindex || "0"), 10) || 0),
+      payload_json: JSON.stringify(msg),
+    });
+    stats.queuedBatches += 1;
+  } catch (e) {
+    console.error("DB storeBatch error:", e?.message || String(e));
+  }
+}
 
-  const device_sn = msg.sn || null;
-  const records = Array.isArray(msg.record) ? msg.record : [];
+function storePunches(sn, normalizedRecords) {
+  const now = new Date().toISOString();
+  let inserted = 0;
 
-  // record: received sendlog (with summary)
-  pushEvent({
-    type: "mqtt_sendlog_received",
-    ...context,
-    sn: device_sn,
-    count: msg.count ?? null,
-    logindex: msg.logindex ?? null,
-    summary: summarizeRecords(records),
+  const tx = db.transaction((rows) => {
+    for (const r of rows) {
+      stmtInsertPunch.run({
+        created_at: now,
+        sn,
+        enrollid: r.enrollid ?? null,
+        timestamp: r.timestamp ?? null,
+        action: r.action ?? null,
+        payload_json: JSON.stringify(r),
+      });
+      inserted += 1;
+    }
   });
 
-  if (!records.length) return;
+  try {
+    tx(normalizedRecords);
+    stats.queuedPunches += inserted;
+  } catch (e) {
+    console.error("DB storePunches error:", e?.message || String(e));
+  }
 
+  return inserted;
+}
+
+function normalizeSendlogToRecords(msg) {
+  const device_sn = msg.sn || null;
+  const records = Array.isArray(msg.record) ? msg.record : [];
   const out = [];
 
   for (const rec of records) {
@@ -369,11 +445,9 @@ async function handleSendLog(msg, context = {}) {
     const action = inferActionFromInout(inout) || "clock_in";
     const timestamp = normalizeTimestamp(rec.time || msg.cloudtime);
 
-    if (DROP_INCOMPLETE) {
-      if (!timestamp) {
-        stats.droppedIncomplete += 1;
-        continue;
-      }
+    if (DROP_INCOMPLETE && !timestamp) {
+      stats.droppedIncomplete += 1;
+      continue;
     }
 
     const key = `${device_sn}|${enrollid}|${timestamp}|${action}`;
@@ -396,7 +470,6 @@ async function handleSendLog(msg, context = {}) {
       name,
 
       raw_json: rec,
-
       raw_msg: {
         cmd: msg.cmd,
         sn: msg.sn,
@@ -407,58 +480,70 @@ async function handleSendLog(msg, context = {}) {
     });
   }
 
-  if (!out.length) return;
+  return out;
+}
 
-  // Bulk forward
-  const payload = {
-    action: "bulk",
-    records: out,
-  };
+async function deliverQueueBatch(limit = QUEUE_RETRY_BATCH_SIZE) {
+  const rows = stmtSelectPending.all(limit);
+  if (!rows.length) return { ok: true, processed: 0, sent: 0, failed: 0 };
+
+  // Build a lovable bulk payload from queued items
+  const records = rows.map((r) => safeParseJson(r.payload_json)).filter(Boolean);
+
+  // If parsing fails, mark them failed
+  const badRows = rows.filter((r) => !safeParseJson(r.payload_json));
+  const now = new Date().toISOString();
+  for (const br of badRows) {
+    stmtMarkFailed.run({ id: br.id, at: now, err: "Invalid JSON payload_json in queue row" });
+  }
+
+  if (!records.length) return { ok: true, processed: rows.length, sent: 0, failed: badRows.length };
 
   const ctx = {
-    sn: device_sn,
-    mqttTopic: context.mqttTopic ?? null,
-    count: msg.count ?? null,
-    logindex: msg.logindex ?? null,
-    recordFirstTime: out[0]?.timestamp ?? null,
-    recordLastTime: out[out.length - 1]?.timestamp ?? null,
+    sn: records[0]?.device_sn || null,
+    queueIds: rows.map((r) => r.id),
+    mode: "queue_retry",
   };
 
   try {
-    const result = await postToLovable(payload, ctx);
+    await postToLovable({ action: "bulk", records }, ctx);
 
-    stats.forwarded += out.length;
+    // Mark all rows as sent
+    const at = new Date().toISOString();
+    const tx = db.transaction((ids) => {
+      for (const id of ids) stmtMarkSent.run({ id, at });
+    });
+    tx(rows.map((r) => r.id));
+
+    stats.forwarded += records.length;
     stats.forwardedBulk += 1;
     stats.lastForwardAt = new Date().toISOString();
 
     stats.lovableOk += 1;
     stats.lovableLastAt = new Date().toISOString();
     stats.lovableLastOk = true;
-    stats.lovableLastStatus = 200; // res.ok already true; actual status logged in event
     stats.lovableLastError = null;
 
-    // extra: mark a “bridge says delivered” event
-    pushEvent({
-      type: "bridge_delivery_ok",
-      ...ctx,
-      forwardedCount: out.length,
-    });
+    pushEvent({ type: "queue_delivery_ok", processed: rows.length, forwardedCount: records.length });
 
-    return result;
+    return { ok: true, processed: rows.length, sent: rows.length, failed: badRows.length };
   } catch (e) {
+    const err = e?.message || String(e);
+    const at = new Date().toISOString();
+
+    const tx = db.transaction((ids) => {
+      for (const id of ids) stmtMarkFailed.run({ id, at, err });
+    });
+    tx(rows.map((r) => r.id));
+
     stats.lovableErr += 1;
     stats.lovableLastAt = new Date().toISOString();
     stats.lovableLastOk = false;
-    stats.lovableLastError = e?.message || String(e);
+    stats.lovableLastError = err;
 
-    pushEvent({
-      type: "bridge_delivery_error",
-      ...ctx,
-      error: stats.lovableLastError,
-      forwardedCount: out.length,
-    });
+    pushEvent({ type: "queue_delivery_error", processed: rows.length, error: err });
 
-    throw e;
+    return { ok: false, processed: rows.length, sent: 0, failed: rows.length, error: err };
   }
 }
 
@@ -466,20 +551,62 @@ async function handleIncomingMqtt(topic, payloadStr) {
   const msg = safeParseJson(payloadStr);
   if (!msg || typeof msg !== "object") return;
 
-  // Only care about cmd:"sendlog"
   if (msg.cmd === "sendlog") {
     const sn = msg.sn || extractSnFromTopic(topic);
 
-    // ACK FIRST (never wait for Lovable)
+    // Store raw batch (audit)
+    storeBatch({ sn, topic, msg });
+
+    // Normalize records + store in local queue BEFORE ACK (so even if container crashes, you still have it)
+    const normalized = normalizeSendlogToRecords({ ...msg, sn: sn || msg.sn });
+    if (normalized.length) storePunches(sn, normalized);
+
+    pushEvent({
+      type: "mqtt_sendlog_received",
+      mqttTopic: topic,
+      sn,
+      count: msg.count ?? null,
+      logindex: msg.logindex ?? null,
+      summary: summarizeRecords(Array.isArray(msg.record) ? msg.record : []),
+      normalizedCount: normalized.length,
+    });
+
+    // ACK FIRST (device stability)
     publishSendlogAck({ sn, count: msg.count, logindex: msg.logindex });
 
-    // Then forward to Lovable
-    await handleSendLog({ ...msg, sn: sn || msg.sn }, { mqttTopic: topic });
+    // Try immediate delivery of just these records (fast path)
+    if (normalized.length) {
+      try {
+        await postToLovable({ action: "bulk", records: normalized }, { sn, mqttTopic: topic, mode: "immediate" });
+
+        // If immediate succeeded, mark those queue rows as sent:
+        // Simple approach: run a retry batch right away (it will pick up pending rows and mark sent)
+        // This avoids needing a per-record id mapping.
+        await deliverQueueBatch(normalized.length);
+
+        stats.lovableOk += 1;
+        stats.lovableLastAt = new Date().toISOString();
+        stats.lovableLastOk = true;
+        stats.lovableLastError = null;
+
+        pushEvent({ type: "bridge_delivery_ok", sn, forwardedCount: normalized.length });
+      } catch (e) {
+        const err = e?.message || String(e);
+        stats.lovableErr += 1;
+        stats.lovableLastAt = new Date().toISOString();
+        stats.lovableLastOk = false;
+        stats.lovableLastError = err;
+        pushEvent({ type: "bridge_delivery_error", sn, error: err, forwardedCount: normalized.length });
+
+        // Do NOT throw; we already queued them, and retry worker will handle it
+        console.error("Immediate Lovable push failed (queued for retry):", err);
+      }
+    }
   }
 }
 
 // ============================
-// MQTT (stable + persistent)
+// MQTT connection
 // ============================
 
 const mqttClient = mqtt.connect(MQTT_URL, {
@@ -566,12 +693,34 @@ mqttClient.on("message", async (topic, payload) => {
   } catch (e) {
     stats.errors += 1;
     stats.lastError = e?.message || String(e);
-    console.error("Forwarding error:", stats.lastError);
+    console.error("Bridge error:", stats.lastError);
   }
 });
 
 // ============================
-// HTTP status + debug endpoints
+// Retry worker
+// ============================
+
+let retryTimer = null;
+function startRetryWorker() {
+  if (retryTimer) return;
+  retryTimer = setInterval(async () => {
+    try {
+      const s = stmtQueueStats.get();
+      if ((s.pending || 0) + (s.failed || 0) === 0) return;
+      await deliverQueueBatch(QUEUE_RETRY_BATCH_SIZE);
+    } catch (e) {
+      console.error("Retry worker error:", e?.message || String(e));
+    }
+  }, QUEUE_RETRY_INTERVAL_SECONDS * 1000).unref();
+
+  console.log(`Queue retry worker: every ${QUEUE_RETRY_INTERVAL_SECONDS}s, batch size ${QUEUE_RETRY_BATCH_SIZE}`);
+}
+
+startRetryWorker();
+
+// ============================
+// HTTP endpoints
 // ============================
 
 const app = express();
@@ -580,6 +729,7 @@ app.use(express.json({ limit: "2mb" }));
 app.use(morgan("combined"));
 
 app.get("/health", (req, res) => {
+  const queue = stmtQueueStats.get();
   res.json({
     ok: true,
     mqtt: {
@@ -593,76 +743,53 @@ app.get("/health", (req, res) => {
       qos: MQTT_QOS,
     },
     lovable: { endpoint: LOVABLE_ENDPOINT },
+    queue: { dbPath: QUEUE_DB_PATH, ...queue },
     config: {
       dedupeSeconds: DEDUPE_SECONDS,
       dropIncomplete: DROP_INCOMPLETE,
       ackTopicSuffix: MQTT_ACK_TOPIC_SUFFIX,
-      recentEventsMax: RECENT_EVENTS_MAX,
-      lovableResponseMaxChars: LOVABLE_RESPONSE_MAX_CHARS,
+      retryIntervalSeconds: QUEUE_RETRY_INTERVAL_SECONDS,
+      retryBatchSize: QUEUE_RETRY_BATCH_SIZE,
     },
     stats,
     time: new Date().toISOString(),
   });
 });
 
-/**
- * Recent truth events.
- * Optional query params:
- *  - limit=50
- *  - type=ack_send_result | mqtt_sendlog_received | lovable_response | bridge_delivery_ok | bridge_delivery_error ...
- *  - sn=AYTI10105321
- */
 app.get("/recent", (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit || "50", 10), 1), 500);
   const type = req.query.type ? String(req.query.type) : null;
   const sn = req.query.sn ? String(req.query.sn) : null;
 
-  let items = recentEvents.slice(); // oldest -> newest
+  let items = recentEvents.slice();
   if (type) items = items.filter((e) => e.type === type);
   if (sn) items = items.filter((e) => (e.sn || e.device_sn) === sn);
-
-  // return newest first for convenience
   items = items.slice(-limit).reverse();
 
-  res.json({
-    ok: true,
-    count: items.length,
-    filters: { limit, type, sn },
-    items,
-  });
+  res.json({ ok: true, count: items.length, filters: { limit, type, sn }, items });
 });
 
-/**
- * Quick “prove it” endpoint:
- * Shows the most recent received sendlog + most recent lovable response for a given SN.
- * /prove?sn=AYTI10105321
- */
-app.get("/prove", (req, res) => {
-  const sn = req.query.sn ? String(req.query.sn) : null;
-  if (!sn) return res.status(400).json({ ok: false, error: "sn is required, e.g. /prove?sn=AYTI10105321" });
+app.get("/queue", (req, res) => {
+  const s = stmtQueueStats.get();
+  res.json({ ok: true, ...s, dbPath: QUEUE_DB_PATH, now: new Date().toISOString() });
+});
 
-  const findLast = (types) =>
-    [...recentEvents].reverse().find((e) => (e.sn === sn || e.device_sn === sn) && types.includes(e.type)) || null;
+app.get("/queue/items", (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.query.limit || "50", 10), 1), 500);
+  const items = stmtLatestQueueItems.all(limit);
+  res.json({ ok: true, count: items.length, items });
+});
 
-  const lastReceived = findLast(["mqtt_sendlog_received"]);
-  const lastAck = findLast(["ack_send_result"]);
-  const lastLovable = findLast(["lovable_response"]);
-  const lastOk = findLast(["bridge_delivery_ok"]);
-  const lastErr = findLast(["bridge_delivery_error"]);
-
-  res.json({
-    ok: true,
-    sn,
-    lastReceived,
-    lastAck,
-    lastLovable,
-    lastDelivery: lastOk || lastErr,
-    now: new Date().toISOString(),
-  });
+// Manual retry: pushes queued items now
+app.post("/retry", async (req, res) => {
+  const limit = Math.min(Math.max(parseInt(req.body?.limit || `${QUEUE_RETRY_BATCH_SIZE}`, 10), 1), 1000);
+  const result = await deliverQueueBatch(limit);
+  res.json({ ok: true, result, now: new Date().toISOString() });
 });
 
 app.listen(PORT, () => {
   console.log(`MQTT→Lovable bridge listening on :${PORT}`);
+  console.log(`Queue DB: ${QUEUE_DB_PATH}`);
 });
 
 // ============================
