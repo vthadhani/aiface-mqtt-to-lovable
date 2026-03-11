@@ -29,8 +29,11 @@ const MQTT_QOS = Number.isFinite(Number(process.env.MQTT_QOS)) ? Number(process.
 
 const MQTT_ACK_TOPIC_SUFFIX = process.env.MQTT_ACK_TOPIC_SUFFIX || "/pub";
 
-const LOVABLE_ENDPOINT =
+// Two Lovable endpoints, one shared API key
+const LOVABLE_ENDPOINT_1 =
   process.env.LOVABLE_ENDPOINT || "https://ndmytnnbirezyrqvejwz.supabase.co/functions/v1/attendance-api";
+const LOVABLE_ENDPOINT_2 =
+  process.env.LOVABLE_ENDPOINT_2 || "https://fmflesqywtuxokjozlkn.supabase.co/functions/v1/attendance-api";
 const LOVABLE_API_KEY = process.env.LOVABLE_API_KEY;
 
 const DEDUPE_SECONDS = Math.max(parseInt(process.env.DEDUPE_SECONDS || "0", 10), 0);
@@ -231,9 +234,6 @@ const stmtLatestQueueItems = db.prepare(`
 // -------------------- Lovable POST (with correct OK/NOT OK detection) --------------------
 
 function lovableLogicalOk(data) {
-  // We treat these as success:
-  // - data.ok === true AND (no results OR all results ok)
-  // Anything else becomes failure so records remain queued.
   if (!data || typeof data !== "object") return false;
 
   if (data.ok !== true) return false;
@@ -244,20 +244,21 @@ function lovableLogicalOk(data) {
   return true;
 }
 
-async function postToLovable(payload, context = {}) {
+async function postToSingleLovable({ endpointName, endpointUrl, payload, context = {} }) {
   const startedAt = Date.now();
 
   pushEvent({
     type: "lovable_send_attempt",
+    endpointName,
+    endpointUrl,
     ...context,
-    lovableEndpoint: LOVABLE_ENDPOINT,
     payloadSummary: {
       action: payload?.action,
       records: Array.isArray(payload?.records) ? payload.records.length : null,
     },
   });
 
-  const res = await fetch(LOVABLE_ENDPOINT, {
+  const res = await fetch(endpointUrl, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -281,6 +282,8 @@ async function postToLovable(payload, context = {}) {
 
   pushEvent({
     type: "lovable_response",
+    endpointName,
+    endpointUrl,
     ...context,
     httpOk: res.ok,
     ok: logicalOk,
@@ -290,11 +293,45 @@ async function postToLovable(payload, context = {}) {
   });
 
   if (!logicalOk) {
-    // even if HTTP 200, treat embedded ok:false as failure
-    throw new Error(`Lovable NOT OK (http=${res.status}): ${snippet}`);
+    throw new Error(`[${endpointName}] Lovable NOT OK (http=${res.status}): ${snippet}`);
   }
 
-  return data;
+  return {
+    endpointName,
+    endpointUrl,
+    status: res.status,
+    ok: true,
+    data,
+  };
+}
+
+async function postToLovable(payload, context = {}) {
+  const endpoints = [
+    { endpointName: "primary", endpointUrl: LOVABLE_ENDPOINT_1 },
+    { endpointName: "secondary", endpointUrl: LOVABLE_ENDPOINT_2 },
+  ];
+
+  const results = [];
+  const errors = [];
+
+  for (const endpoint of endpoints) {
+    try {
+      const result = await postToSingleLovable({
+        ...endpoint,
+        payload,
+        context,
+      });
+      results.push(result);
+    } catch (e) {
+      errors.push(e?.message || String(e));
+    }
+  }
+
+  if (errors.length > 0) {
+    throw new Error(errors.join(" | "));
+  }
+
+  return results;
 }
 
 // -------------------- stats --------------------
@@ -360,13 +397,28 @@ function publishSendlogAck({ sn, count, logindex }) {
         stats.lastAckError = err.message;
         stats.lastAckErrorAt = new Date().toISOString();
         console.error(`ACK publish error to ${ackTopic}:`, err.message);
-        pushEvent({ type: "ack_send_result", sn, ackTopic, ok: false, error: err.message, count: payload.count, logindex: payload.logindex });
+        pushEvent({
+          type: "ack_send_result",
+          sn,
+          ackTopic,
+          ok: false,
+          error: err.message,
+          count: payload.count,
+          logindex: payload.logindex,
+        });
       } else {
         stats.acksSent += 1;
         stats.lastAckAt = new Date().toISOString();
         stats.lastAck = { sn, count: payload.count, logindex: payload.logindex };
         console.log(`ACK sent -> ${ackTopic} count=${payload.count} logindex=${payload.logindex}`);
-        pushEvent({ type: "ack_send_result", sn, ackTopic, ok: true, count: payload.count, logindex: payload.logindex });
+        pushEvent({
+          type: "ack_send_result",
+          sn,
+          ackTopic,
+          ok: true,
+          count: payload.count,
+          logindex: payload.logindex,
+        });
       }
     });
   } catch (e) {
@@ -374,7 +426,15 @@ function publishSendlogAck({ sn, count, logindex }) {
     stats.lastAckError = e?.message || String(e);
     stats.lastAckErrorAt = new Date().toISOString();
     console.error(`ACK publish exception to ${ackTopic}:`, stats.lastAckError);
-    pushEvent({ type: "ack_send_result", sn, ackTopic, ok: false, error: stats.lastAckError, count: payload.count, logindex: payload.logindex });
+    pushEvent({
+      type: "ack_send_result",
+      sn,
+      ackTopic,
+      ok: false,
+      error: stats.lastAckError,
+      count: payload.count,
+      logindex: payload.logindex,
+    });
   }
 }
 
@@ -487,10 +547,8 @@ async function deliverQueueBatch(limit = QUEUE_RETRY_BATCH_SIZE) {
   const rows = stmtSelectPending.all(limit);
   if (!rows.length) return { ok: true, processed: 0, sent: 0, failed: 0 };
 
-  // Build a lovable bulk payload from queued items
   const records = rows.map((r) => safeParseJson(r.payload_json)).filter(Boolean);
 
-  // If parsing fails, mark them failed
   const badRows = rows.filter((r) => !safeParseJson(r.payload_json));
   const now = new Date().toISOString();
   for (const br of badRows) {
@@ -508,7 +566,6 @@ async function deliverQueueBatch(limit = QUEUE_RETRY_BATCH_SIZE) {
   try {
     await postToLovable({ action: "bulk", records }, ctx);
 
-    // Mark all rows as sent
     const at = new Date().toISOString();
     const tx = db.transaction((ids) => {
       for (const id of ids) stmtMarkSent.run({ id, at });
@@ -554,10 +611,8 @@ async function handleIncomingMqtt(topic, payloadStr) {
   if (msg.cmd === "sendlog") {
     const sn = msg.sn || extractSnFromTopic(topic);
 
-    // Store raw batch (audit)
     storeBatch({ sn, topic, msg });
 
-    // Normalize records + store in local queue BEFORE ACK (so even if container crashes, you still have it)
     const normalized = normalizeSendlogToRecords({ ...msg, sn: sn || msg.sn });
     if (normalized.length) storePunches(sn, normalized);
 
@@ -571,17 +626,12 @@ async function handleIncomingMqtt(topic, payloadStr) {
       normalizedCount: normalized.length,
     });
 
-    // ACK FIRST (device stability)
     publishSendlogAck({ sn, count: msg.count, logindex: msg.logindex });
 
-    // Try immediate delivery of just these records (fast path)
     if (normalized.length) {
       try {
         await postToLovable({ action: "bulk", records: normalized }, { sn, mqttTopic: topic, mode: "immediate" });
 
-        // If immediate succeeded, mark those queue rows as sent:
-        // Simple approach: run a retry batch right away (it will pick up pending rows and mark sent)
-        // This avoids needing a per-record id mapping.
         await deliverQueueBatch(normalized.length);
 
         stats.lovableOk += 1;
@@ -598,7 +648,6 @@ async function handleIncomingMqtt(topic, payloadStr) {
         stats.lovableLastError = err;
         pushEvent({ type: "bridge_delivery_error", sn, error: err, forwardedCount: normalized.length });
 
-        // Do NOT throw; we already queued them, and retry worker will handle it
         console.error("Immediate Lovable push failed (queued for retry):", err);
       }
     }
@@ -742,7 +791,12 @@ app.get("/health", (req, res) => {
       reconnectPeriodMs: MQTT_RECONNECT_PERIOD,
       qos: MQTT_QOS,
     },
-    lovable: { endpoint: LOVABLE_ENDPOINT },
+    lovable: {
+      endpoints: [
+        LOVABLE_ENDPOINT_1,
+        LOVABLE_ENDPOINT_2,
+      ],
+    },
     queue: { dbPath: QUEUE_DB_PATH, ...queue },
     config: {
       dedupeSeconds: DEDUPE_SECONDS,
@@ -790,6 +844,8 @@ app.post("/retry", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`MQTT→Lovable bridge listening on :${PORT}`);
   console.log(`Queue DB: ${QUEUE_DB_PATH}`);
+  console.log(`Lovable primary: ${LOVABLE_ENDPOINT_1}`);
+  console.log(`Lovable secondary: ${LOVABLE_ENDPOINT_2}`);
 });
 
 // ============================
